@@ -1,172 +1,242 @@
-/*
- * Copyright (C) 2007-2023 Intel Corporation.
- * SPDX-License-Identifier: MIT
- */
-
-/*! @file
- *  This is an example of the PIN tool that demonstrates some basic PIN APIs 
- *  and could serve as the starting point for developing your first PIN tool
- */
-
-#include "pin.H"
+#include <algorithm> 
+#include <vector> 
+#include <list>
 #include <iostream>
 #include <fstream>
-using std::cerr;
-using std::endl;
-using std::string;
+#include "pin.H"
 
-/* ================================================================== */
-// Global variables
-/* ================================================================== */
+using namespace std; 
 
-UINT64 insCount    = 0; //number of dynamically executed instructions
-UINT64 bblCount    = 0; //number of dynamically executed basic blocks
-UINT64 threadCount = 0; //total number of threads, including main thread
+std::ofstream OutFile;
 
-std::ostream* out = &cerr;
+// -------------------------------------------------------------------------
+// PHASE 0, 1, 2, 3: CACHE SIMULATOR CLASSES
+// -------------------------------------------------------------------------
 
-/* ===================================================================== */
-// Command line switches
-/* ===================================================================== */
-KNOB< string > KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool", "o", "", "specify file name for MyPinTool output");
+// Helper function to calculate log base 2 for integer math
+UINT32 calcLog2(UINT32 val) { // Block size must be in power of 2 for correct working. Madhav pls make it more robust.
+    UINT32 res = 0;
+    while (val >>= 1) res++;
+    return res;
+}
 
-KNOB< BOOL > KnobCount(KNOB_MODE_WRITEONCE, "pintool", "count", "1",
-                       "count instructions, basic blocks and threads in the application");
+enum ReplacementPolicy {
+    LRU,
+    FIFO
+};
 
-/* ===================================================================== */
-// Utilities
-/* ===================================================================== */
+// 1. Cache Block (Holds the valid bit and tag)
+struct CacheBlock {
+    bool valid;
+    UINT64 tag;
+    CacheBlock() : valid(false), tag(0) {}
+};
 
-/*!
- *  Print out help message.
- */
-INT32 Usage()
-{
-    cerr << "This tool prints out the number of dynamically executed " << endl
-         << "instructions, basic blocks and threads in the application." << endl
-         << endl;
+// 2. Cache Set (Handles Associativity and Replacement Policy)
+class CacheSet {
+private:
+    UINT32 associativity;
+    ReplacementPolicy policy;
+    list<CacheBlock> blocks; // actually a linked list
 
-    cerr << KNOB_BASE::StringKnobSummary() << endl;
+public:
+    CacheSet(UINT32 assoc, ReplacementPolicy pol) : associativity(assoc), policy(pol) {}
 
+    // Returns true on Hit, false on Miss
+    bool access(UINT64 tag) {
+        // Search the set for a matching tag
+        for (auto it = blocks.begin(); it != blocks.end(); ++it) {
+            if (it->valid && it->tag == tag) {
+                // HIT! 
+                
+                if (policy == LRU) {
+                    // LRU Policy: Move this accessed block to the front
+                    CacheBlock hitBlock = *it;
+                    blocks.erase(it);
+                    blocks.push_front(hitBlock);
+                }
+                // If FIFO: Do absolutely nothing. The order it entered doesn't change.
+                
+                return true; 
+            }
+        }
+
+        // in case of miss:
+        CacheBlock newBlock;
+        newBlock.valid = true;
+        newBlock.tag = tag;
+
+        if (blocks.size() < associativity) {
+            // Still have room in this set
+            blocks.push_front(newBlock);
+        } else {
+            // Set is full. 
+            // For BOTH LRU and FIFO, the block at the back is the one we want to evict.
+            blocks.pop_back();
+            blocks.push_front(newBlock);
+        }
+        return false;
+    }
+};
+
+// 3. Cache Orchestrator (Breaks down addresses and routes to sets)
+class Cache {
+private:
+    UINT32 numSets;
+    UINT32 blockSize;
+    UINT32 associativity;
+    ReplacementPolicy policy;
+    
+    UINT32 offsetBits;
+    UINT32 indexBits;
+    UINT64 indexMask;
+    
+    std::vector<CacheSet> sets;
+
+    // Statistics
+    UINT64 hits;
+    UINT64 misses;
+    UINT64 accesses;
+
+public:
+    Cache(UINT32 sizeBytes, UINT32 bSize, UINT32 assoc, ReplacementPolicy pol) {
+        blockSize = bSize;
+        associativity = assoc;
+        policy = pol;
+        numSets = sizeBytes / (blockSize * associativity);
+
+        offsetBits = calcLog2(blockSize);
+        indexBits = calcLog2(numSets);
+        indexMask = numSets - 1; 
+
+        // Initialize sets with the chosen policy
+        for (UINT32 i = 0; i < numSets; ++i) {
+            sets.push_back(CacheSet(associativity, policy));
+        }
+
+        hits = misses = accesses = 0;
+    }
+
+    void access(UINT64 addr) {
+        accesses++;
+        
+        UINT64 index = (addr >> offsetBits) & indexMask;
+        UINT64 tag = addr >> (offsetBits + indexBits);
+
+        if (sets[index].access(tag)) {
+            hits++;
+        } else {
+            misses++;
+        }
+    }
+
+    // Getters for final report
+    UINT64 getHits() const { return hits; }
+    UINT64 getMisses() const { return misses; }
+    UINT64 getAccesses() const { return accesses; }
+    double getHitRate() const { 
+        return accesses == 0 ? 0.0 : (double)hits / accesses * 100.0; 
+    }
+    string getPolicyName() const {
+        return (policy == LRU) ? "LRU" : "FIFO";
+    }
+};
+
+// -------------------------------------------------------------------------
+// PINTOOL INSTRUMENTATION
+// -------------------------------------------------------------------------
+
+static UINT64 icount = 0;
+ADDRINT mainLow = 0, mainHigh = 0;
+
+// Instantiate our cache simulator globally. 
+Cache* dl1_cache; 
+
+VOID docount() { icount++; }
+
+// A single, unified memory access hook
+VOID RecordMemAccess(VOID* addr) {
+    dl1_cache->access((UINT64)addr);
+}
+
+VOID Instruction(INS ins, VOID* v) {
+    // Only instrument instructions belonging to the main executable
+    if (INS_Address(ins) <= mainHigh && INS_Address(ins) >= mainLow) {
+        
+        // ins count
+        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)docount, IARG_END);   
+
+        // Iterate over every memory operand the instruction has
+        UINT32 memOperands = INS_MemoryOperandCount(ins);
+        for (UINT32 memOp = 0; memOp < memOperands; memOp++) {
+            
+            // If the operand is read from memory
+            if (INS_MemoryOperandIsRead(ins, memOp)) {
+                INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordMemAccess, 
+                               IARG_MEMORYOP_EA, memOp, 
+                               IARG_END);
+            }
+            
+            // If the operand is written to memory
+            // Note: An operand can be BOTH read and written (e.g., add [rax], 1)
+            // This accurately simulates the two distinct cache accesses it requires.
+            if (INS_MemoryOperandIsWritten(ins, memOp)) {
+                INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordMemAccess, 
+                               IARG_MEMORYOP_EA, memOp, 
+                               IARG_END);
+            }
+        }
+    }
+}
+
+KNOB< std::string > KnobInsCountFile(KNOB_MODE_WRITEONCE, "pintool", "i", "cache_stats.out", "specify output file name");
+
+VOID Fini(INT32 code, VOID* v) {
+    // Dump final Cache Statistics
+    OutFile.setf(std::ios::showbase);
+    OutFile << "-------------------------------------------------------------------------------\n";  
+    OutFile << "L1 DATA CACHE SIMULATION RESULTS\n";
+    OutFile << "-------------------------------------------------------------------------------\n";  
+    
+    OutFile << "Total Instructions  : " << icount << "\n";
+    OutFile << "Total Mem Accesses  : " << dl1_cache->getAccesses() << "\n";
+    OutFile << "Cache Hits          : " << dl1_cache->getHits() << "\n";
+    OutFile << "Cache Misses        : " << dl1_cache->getMisses() << "\n";
+    OutFile << "Hit Rate            : " << dl1_cache->getHitRate() << " %\n";
+    
+    OutFile << "-------------------------------------------------------------------------------\n";  
+    OutFile.close();
+
+    // Clean up memory
+    delete dl1_cache;
+}
+
+INT32 Usage() {
+    std::cerr << "This tool simulates a Data Cache." << std::endl;
+    std::cerr << std::endl << KNOB_BASE::StringKnobSummary() << std::endl;
     return -1;
 }
 
-/* ===================================================================== */
-// Analysis routines
-/* ===================================================================== */
-
-/*!
- * Increase counter of the executed basic blocks and instructions.
- * This function is called for every basic block when it is about to be executed.
- * @param[in]   numInstInBbl    number of instructions in the basic block
- * @note use atomic operations for multi-threaded applications
- */
-VOID CountBbl(UINT32 numInstInBbl)
-{
-    bblCount++;
-    insCount += numInstInBbl;
-}
-
-/* ===================================================================== */
-// Instrumentation callbacks
-/* ===================================================================== */
-
-/*!
- * Insert call to the CountBbl() analysis routine before every basic block 
- * of the trace.
- * This function is called every time a new trace is encountered.
- * @param[in]   trace    trace to be instrumented
- * @param[in]   v        value specified by the tool in the TRACE_AddInstrumentFunction
- *                       function call
- */
-VOID Trace(TRACE trace, VOID* v)
-{
-    // Visit every basic block in the trace
-    for (BBL bbl = TRACE_BblHead(trace); BBL_Valid(bbl); bbl = BBL_Next(bbl))
-    {
-        // Insert a call to CountBbl() before every basic bloc, passing the number of instructions
-        BBL_InsertCall(bbl, IPOINT_BEFORE, (AFUNPTR)CountBbl, IARG_UINT32, BBL_NumIns(bbl), IARG_END);
+VOID Image(IMG img, VOID *v) {
+    if (IMG_IsMainExecutable(img)) {
+        mainLow = IMG_LowAddress(img);
+        mainHigh = IMG_HighAddress(img);
     }
 }
 
-/*!
- * Increase counter of threads in the application.
- * This function is called for every thread created by the application when it is
- * about to start running (including the root thread).
- * @param[in]   threadIndex     ID assigned by PIN to the new thread
- * @param[in]   ctxt            initial register state for the new thread
- * @param[in]   flags           thread creation flags (OS specific)
- * @param[in]   v               value specified by the tool in the 
- *                              PIN_AddThreadStartFunction function call
- */
-VOID ThreadStart(THREADID threadIndex, CONTEXT* ctxt, INT32 flags, VOID* v) { threadCount++; }
+int main(int argc, char* argv[]) {
+    if (PIN_Init(argc, argv)) return Usage();
 
-/*!
- * Print out analysis results.
- * This function is called when the application exits.
- * @param[in]   code            exit code of the application
- * @param[in]   v               value specified by the tool in the 
- *                              PIN_AddFiniFunction function call
- */
-VOID Fini(INT32 code, VOID* v)
-{
-    *out << "===============================================" << endl;
-    *out << "MyPinTool analysis results: " << endl;
-    *out << "Number of instructions: " << insCount << endl;
-    *out << "Number of basic blocks: " << bblCount << endl;
-    *out << "Number of threads: " << threadCount << endl;
-    *out << "===============================================" << endl;
-}
+    // Initialize Cache: 32KB Size, 64-Byte Blocks, 8-way Associative, FIFO Policy
+    dl1_cache = new Cache(32768, 64, 8, FIFO);
 
-/*!
- * The main procedure of the tool.
- * This function is called when the application image is loaded but not yet started.
- * @param[in]   argc            total number of elements in the argv array
- * @param[in]   argv            array of command line arguments, 
- *                              including pin -t <toolname> -- ...
- */
-int main(int argc, char* argv[])
-{
-    // Initialize PIN library. Print help message if -h(elp) is specified
-    // in the command line or the command line is invalid
-    if (PIN_Init(argc, argv))
-    {
-        return Usage();
-    }
+    OutFile.open(KnobInsCountFile.Value().c_str());
 
-    string fileName = KnobOutputFile.Value();
+    IMG_AddInstrumentFunction(Image, 0);
+    INS_AddInstrumentFunction(Instruction, 0);
+    PIN_AddFiniFunction(Fini, 0);
 
-    if (!fileName.empty())
-    {
-        out = new std::ofstream(fileName.c_str());
-    }
-
-    if (KnobCount)
-    {
-        // Register function to be called to instrument traces
-        TRACE_AddInstrumentFunction(Trace, 0);
-
-        // Register function to be called for every thread before it starts running
-        PIN_AddThreadStartFunction(ThreadStart, 0);
-
-        // Register function to be called when the application exits
-        PIN_AddFiniFunction(Fini, 0);
-    }
-
-    cerr << "===============================================" << endl;
-    cerr << "This application is instrumented by MyPinTool" << endl;
-    if (!KnobOutputFile.Value().empty())
-    {
-        cerr << "See file " << KnobOutputFile.Value() << " for analysis results" << endl;
-    }
-    cerr << "===============================================" << endl;
-
-    // Start the program, never returns
     PIN_StartProgram();
 
     return 0;
 }
-
-/* ===================================================================== */
-/* eof */
-/* ===================================================================== */
