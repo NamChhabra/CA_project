@@ -53,11 +53,11 @@ Results are written to `cache_stats.out`, configurable via the `-i` flag:
 
 ```
 L1 DATA CACHE SIMULATION RESULTS
-Total Instructions  : <count>
-Total Mem Accesses  : <count>
-Cache Hits          : <count>
-Cache Misses        : <count>
-Hit Rate            : <percent> %
+Total Instructions  : 199061
+Total Mem Accesses  : 124051
+Cache Hits          : 123921
+Cache Misses        : 130
+Hit Rate            : 99.8952 %
 ```
 
 ## Building and Running
