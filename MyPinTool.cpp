@@ -9,16 +9,8 @@ using namespace std;
 
 std::ofstream OutFile;
 
-// -------------------------------------------------------------------------
-// PHASE 0, 1, 2, 3: CACHE SIMULATOR CLASSES
-// -------------------------------------------------------------------------
 
-// Helper function to calculate log base 2 for integer math
-UINT32 calcLog2(UINT32 val) { // Block size must be in power of 2 for correct working. Madhav pls make it more robust.
-    UINT32 res = 0;
-    while (val >>= 1) res++;
-    return res;
-}
+// PHASE 0, 1, 2, 3: CACHE SIMULATOR CLASSES
 
 enum ReplacementPolicy {
     LRU,
@@ -47,7 +39,7 @@ public:
         // Search the set for a matching tag
         for (auto it = blocks.begin(); it != blocks.end(); ++it) {
             if (it->valid && it->tag == tag) {
-                // HIT! 
+                // check if hit
                 
                 if (policy == LRU) {
                     // LRU Policy: Move this accessed block to the front
@@ -55,7 +47,7 @@ public:
                     blocks.erase(it);
                     blocks.push_front(hitBlock);
                 }
-                // If FIFO: Do absolutely nothing. The order it entered doesn't change.
+                // else if FIFO: make no changes to cache
                 
                 return true; 
             }
@@ -79,7 +71,7 @@ public:
     }
 };
 
-// 3. Cache Orchestrator (Breaks down addresses and routes to sets)
+// 3. The Cache Class
 class Cache {
 private:
     UINT32 numSets;
@@ -87,11 +79,7 @@ private:
     UINT32 associativity;
     ReplacementPolicy policy;
     
-    UINT32 offsetBits;
-    UINT32 indexBits;
-    UINT64 indexMask;
-    
-    std::vector<CacheSet> sets;
+    vector<CacheSet> sets;
 
     // Statistics
     UINT64 hits;
@@ -105,10 +93,6 @@ public:
         policy = pol;
         numSets = sizeBytes / (blockSize * associativity);
 
-        offsetBits = calcLog2(blockSize);
-        indexBits = calcLog2(numSets);
-        indexMask = numSets - 1; 
-
         // Initialize sets with the chosen policy
         for (UINT32 i = 0; i < numSets; ++i) {
             sets.push_back(CacheSet(associativity, policy));
@@ -120,8 +104,10 @@ public:
     void access(UINT64 addr) {
         accesses++;
         
-        UINT64 index = (addr >> offsetBits) & indexMask;
-        UINT64 tag = addr >> (offsetBits + indexBits);
+        UINT32 offset = addr % blockSize;
+        UINT64 blockAddress = addr / blockSize; 
+        UINT64 index = blockAddress % numSets;  
+        UINT64 tag = blockAddress / numSets;    
 
         if (sets[index].access(tag)) {
             hits++;
@@ -130,7 +116,6 @@ public:
         }
     }
 
-    // Getters for final report
     UINT64 getHits() const { return hits; }
     UINT64 getMisses() const { return misses; }
     UINT64 getAccesses() const { return accesses; }
@@ -178,7 +163,7 @@ VOID Instruction(INS ins, VOID* v) {
             }
             
             // If the operand is written to memory
-            // Note: An operand can be BOTH read and written (e.g., add [rax], 1)
+            // An operand can be BOTH read and written (e.g., add [rax], 1)
             // This accurately simulates the two distinct cache accesses it requires.
             if (INS_MemoryOperandIsWritten(ins, memOp)) {
                 INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordMemAccess, 
@@ -189,7 +174,7 @@ VOID Instruction(INS ins, VOID* v) {
     }
 }
 
-KNOB< std::string > KnobInsCountFile(KNOB_MODE_WRITEONCE, "pintool", "i", "cache_stats.out", "specify output file name");
+KNOB< string > KnobInsCountFile(KNOB_MODE_WRITEONCE, "pintool", "i", "cache_stats.out", "specify output file name");
 
 VOID Fini(INT32 code, VOID* v) {
     // Dump final Cache Statistics
@@ -207,7 +192,7 @@ VOID Fini(INT32 code, VOID* v) {
     OutFile << "-------------------------------------------------------------------------------\n";  
     OutFile.close();
 
-    // Clean up memory
+    // Clean up memory (manual garbage collection :(  )
     delete dl1_cache;
 }
 
