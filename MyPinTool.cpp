@@ -104,7 +104,6 @@ public:
     void access(UINT64 addr) {
         accesses++;
         
-        UINT32 offset = addr % blockSize;
         UINT64 blockAddress = addr / blockSize; 
         UINT64 index = blockAddress % numSets;  
         UINT64 tag = blockAddress / numSets;    
