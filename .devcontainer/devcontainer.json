@@ -1,0 +1,8 @@
+{
+    "name": "Intel Pin Environment",
+    "image": "mcr.microsoft.com/devcontainers/cpp:ubuntu-22.04",
+    "features": {
+        "ghcr.io/devcontainers/features/common-utils:1": {}
+    },
+    "postCreateCommand": "bash .devcontainer/setup-pin.sh"
+}
