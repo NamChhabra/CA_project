@@ -89,11 +89,3 @@ pin -t obj-intel64/cache_sim.so -i my_output.out -- ./your_program
 
 **Write Policies** — Add support for write-through (cache and next memory level updated simultaneously on a write hit) and write-back (only the cache block is updated on a write hit, marked dirty, and written to the next level on eviction). Write-allocate and no-write-allocate behavior will also be configurable.
 
-## File Structure
-
-```
-.
-├── cache_sim.cpp       # Main source: cache classes + Pin instrumentation
-├── makefile            # Pin tool build config
-└── cache_stats.out     # Generated output (after running)
-```
