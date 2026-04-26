@@ -3,25 +3,29 @@
 #include <list>
 #include <iostream>
 #include <fstream>
+#include <random>
 #include "pin.H"
 
 using namespace std; 
 
 std::ofstream OutFile;
 
-
 // PHASE 0, 1, 2, 3: CACHE SIMULATOR CLASSES
 
 enum ReplacementPolicy {
     LRU,
-    FIFO
+    FIFO,
+    LFU,
+    RAN
 };
 
-// 1. Cache Block (Holds the valid bit and tag)
+// 1. Cache Block (Holds valid bit, dirty bit, freq, and tag)
 struct CacheBlock {
     bool valid;
+    bool dirty; // NEW: Tracks modified data for write-back
     UINT64 tag;
-    CacheBlock() : valid(false), tag(0) {}
+    UINT32 freq;
+    CacheBlock() : valid(false), dirty(false), tag(0), freq(0) {}
 };
 
 // 2. Cache Set (Handles Associativity and Replacement Policy)
@@ -29,42 +33,76 @@ class CacheSet {
 private:
     UINT32 associativity;
     ReplacementPolicy policy;
-    list<CacheBlock> blocks; // actually a linked list
+    list<CacheBlock> blocks; 
+
+    std::mt19937 gen;
+    std::uniform_int_distribution<int> dist;
 
 public:
-    CacheSet(UINT32 assoc, ReplacementPolicy pol) : associativity(assoc), policy(pol) {}
+    CacheSet(UINT32 assoc, ReplacementPolicy pol) : associativity(assoc), policy(pol), gen(random_device{}()),
+          dist(0, assoc - 1) {}
 
-    // Returns true on Hit, false on Miss
-    bool access(UINT64 tag) {
+    // Accepts isWrite, returns evicted state by reference
+    bool access(UINT64 tag, bool isWrite, bool& evictedDirty, UINT64& evictedTag) {
+        evictedDirty = false; // Default to false
+
         // Search the set for a matching tag
         for (auto it = blocks.begin(); it != blocks.end(); ++it) {
             if (it->valid && it->tag == tag) {
-                // check if hit
-                
-                if (policy == LRU) {
-                    // LRU Policy: Move this accessed block to the front
+                // HIT!
+                if (isWrite) it->dirty = true; // Mark as dirty on write
+
+                if (policy == LFU || policy == FIFO || policy == RAN){
+                    it->freq++;
+                }
+                else if (policy == LRU) {
                     CacheBlock hitBlock = *it;
+                    hitBlock.freq++;
                     blocks.erase(it);
                     blocks.push_front(hitBlock);
                 }
-                // else if FIFO: make no changes to cache
-                
                 return true; 
             }
         }
 
-        // in case of miss:
+        // MISS!
         CacheBlock newBlock;
         newBlock.valid = true;
+        newBlock.dirty = isWrite; // starts dirty on write miss
         newBlock.tag = tag;
+        newBlock.freq = 1;
 
         if (blocks.size() < associativity) {
             // Still have room in this set
             blocks.push_front(newBlock);
         } else {
-            // Set is full. 
-            // For BOTH LRU and FIFO, the block at the back is the one we want to evict.
-            blocks.pop_back();
+            // Set is full. Find the victim to evict.
+            auto victim = blocks.end();
+
+            if (policy == LRU || policy == FIFO) {
+                victim = std::prev(blocks.end()); // The block at the back
+            }
+            else if (policy == LFU) {
+                victim = blocks.begin();
+                for (auto it = blocks.begin(); it != blocks.end(); ++it) {
+                    if (it->freq < victim->freq) {
+                        victim = it;
+                    }
+                }
+            }
+            else if (policy == RAN) {
+                int idx = dist(gen);
+                victim = blocks.begin();
+                std::advance(victim, idx); 
+            }
+
+            // if the chosen victim is dirty before erasing it
+            if (victim->dirty) {
+                evictedDirty = true;
+                evictedTag = victim->tag;
+            }
+
+            blocks.erase(victim);
             blocks.push_front(newBlock);
         }
         return false;
@@ -93,7 +131,6 @@ public:
         policy = pol;
         numSets = sizeBytes / (blockSize * associativity);
 
-        // Initialize sets with the chosen policy
         for (UINT32 i = 0; i < numSets; ++i) {
             sets.push_back(CacheSet(associativity, policy));
         }
@@ -101,18 +138,34 @@ public:
         hits = misses = accesses = 0;
     }
 
-    void access(UINT64 addr) {
+    // Accepts isWrite, processes Write-Backs
+    bool access(UINT64 addr, bool isWrite, bool& evictWB, UINT64& wbAddr) {
         accesses++;
         
         UINT64 blockAddress = addr / blockSize; 
         UINT64 index = blockAddress % numSets;  
         UINT64 tag = blockAddress / numSets;    
 
-        if (sets[index].access(tag)) {
+        bool evictedDirty = false;
+        UINT64 evictedTag = 0;
+
+        // Pass write state down to the set
+        bool hit = sets[index].access(tag, isWrite, evictedDirty, evictedTag);
+        
+        // If a dirty block was evicted, rebuild its absolute address
+        if (evictedDirty) {
+            evictWB = true;
+            wbAddr = ((evictedTag * numSets) + index) * blockSize;
+        } else {
+            evictWB = false;
+        }
+
+        if (hit) {
             hits++;
         } else {
             misses++;
         }
+        return hit;
     }
 
     UINT64 getHits() const { return hits; }
@@ -122,7 +175,10 @@ public:
         return accesses == 0 ? 0.0 : (double)hits / accesses * 100.0; 
     }
     string getPolicyName() const {
-        return (policy == LRU) ? "LRU" : "FIFO";
+        if (policy == LRU) return "LRU";
+        if (policy == FIFO) return "FIFO";
+        if (policy == LFU) return "LFU";
+        return "RANDOM";
     }
 };
 
@@ -133,40 +189,53 @@ public:
 static UINT64 icount = 0;
 ADDRINT mainLow = 0, mainHigh = 0;
 
-// Instantiate our cache simulator globally. 
+// Instantiate our caches
 Cache* dl1_cache; 
+Cache* dl2_cache;
 
 VOID docount() { icount++; }
 
-// A single, unified memory access hook
-VOID RecordMemAccess(VOID* addr) {
-    dl1_cache->access((UINT64)addr);
+// Unified memory access hook, now aware of Read/Write and Write-Backs
+VOID RecordMemAccess(VOID* addr, bool isWrite) {
+    bool evictWB = false;
+    UINT64 wbAddr = 0;
+
+    // 1. Try L1 Cache
+    if (!dl1_cache->access((UINT64)addr, isWrite, evictWB, wbAddr)) {
+        // L1 MISS: Fetch the missing block from L2 (This is a Read from L2's perspective)
+        bool dummyWB; UINT64 dummyAddr;
+        dl2_cache->access((UINT64)addr, false, dummyWB, dummyAddr);
+    }
+
+    // 2. Did L1 kick out a dirty block to make room?
+    if (evictWB) {
+        // L1 WRITE-BACK: Write the modified block down to L2
+        bool dummyWB; UINT64 dummyAddr;
+        dl2_cache->access(wbAddr, true, dummyWB, dummyAddr);
+    }
 }
 
 VOID Instruction(INS ins, VOID* v) {
-    // Only instrument instructions belonging to the main executable
     if (INS_Address(ins) <= mainHigh && INS_Address(ins) >= mainLow) {
         
-        // ins count
         INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)docount, IARG_END);   
 
-        // Iterate over every memory operand the instruction has
         UINT32 memOperands = INS_MemoryOperandCount(ins);
         for (UINT32 memOp = 0; memOp < memOperands; memOp++) {
             
-            // If the operand is read from memory
+            // Route Reads
             if (INS_MemoryOperandIsRead(ins, memOp)) {
                 INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordMemAccess, 
                                IARG_MEMORYOP_EA, memOp, 
+                               IARG_BOOL, false, // isWrite = false
                                IARG_END);
             }
             
-            // If the operand is written to memory
-            // An operand can be BOTH read and written (e.g., add [rax], 1)
-            // This accurately simulates the two distinct cache accesses it requires.
+            // Route Writes
             if (INS_MemoryOperandIsWritten(ins, memOp)) {
                 INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordMemAccess, 
                                IARG_MEMORYOP_EA, memOp, 
+                               IARG_BOOL, true,  // isWrite = true
                                IARG_END);
             }
         }
@@ -176,10 +245,9 @@ VOID Instruction(INS ins, VOID* v) {
 KNOB< string > KnobInsCountFile(KNOB_MODE_WRITEONCE, "pintool", "i", "cache_stats.out", "specify output file name");
 
 VOID Fini(INT32 code, VOID* v) {
-    // Dump final Cache Statistics
     OutFile.setf(std::ios::showbase);
     OutFile << "-------------------------------------------------------------------------------\n";  
-    OutFile << "L1 DATA CACHE SIMULATION RESULTS\n";
+    OutFile << "L1 DATA CACHE SIMULATION RESULTS (" << dl1_cache->getPolicyName() << ")\n";
     OutFile << "-------------------------------------------------------------------------------\n";  
     
     OutFile << "Total Instructions  : " << icount << "\n";
@@ -189,15 +257,24 @@ VOID Fini(INT32 code, VOID* v) {
     OutFile << "Hit Rate            : " << dl1_cache->getHitRate() << " %\n";
     
     OutFile << "-------------------------------------------------------------------------------\n";  
+    OutFile << "L2 DATA CACHE SIMULATION RESULTS (" << dl2_cache->getPolicyName() << ")\n";
+    OutFile << "-------------------------------------------------------------------------------\n";  
+    
+    OutFile << "Total Mem Accesses  : " << dl2_cache->getAccesses() << "\n";
+    OutFile << "Cache Hits          : " << dl2_cache->getHits() << "\n";
+    OutFile << "Cache Misses        : " << dl2_cache->getMisses() << "\n";
+    OutFile << "Hit Rate            : " << dl2_cache->getHitRate() << " %\n";
+    
+    OutFile << "-------------------------------------------------------------------------------\n";  
     OutFile.close();
 
-    // Clean up memory (manual garbage collection :(  )
     delete dl1_cache;
+    delete dl2_cache;
 }
 
 INT32 Usage() {
-    std::cerr << "This tool simulates a Data Cache." << std::endl;
-    std::cerr << std::endl << KNOB_BASE::StringKnobSummary() << std::endl;
+    cerr << "This tool simulates a Data Cache." << std::endl;
+    cerr << std::endl << KNOB_BASE::StringKnobSummary() << std::endl;
     return -1;
 }
 
@@ -211,8 +288,11 @@ VOID Image(IMG img, VOID *v) {
 int main(int argc, char* argv[]) {
     if (PIN_Init(argc, argv)) return Usage();
 
-    // Initialize Cache: 32KB Size, 64-Byte Blocks, 8-way Associative, FIFO Policy
-    dl1_cache = new Cache(32768, 64, 8, FIFO);
+    // Initialize L1 Cache (Notice I fixed 3276 -> 32768 for a 32KB cache!)
+    dl1_cache = new Cache(32768, 64, 8, LFU);
+    
+    // Initialize L2 Cache
+    dl2_cache = new Cache(262144, 64, 16, LRU); 
 
     OutFile.open(KnobInsCountFile.Value().c_str());
 
