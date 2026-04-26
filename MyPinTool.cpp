@@ -4,6 +4,7 @@
 #include <iostream>
 #include <fstream>
 #include <random>
+#include <iomanip>
 #include "pin.H"
 
 using namespace std; 
@@ -22,7 +23,7 @@ enum ReplacementPolicy {
 // 1. Cache Block (Holds valid bit, dirty bit, freq, and tag)
 struct CacheBlock {
     bool valid;
-    bool dirty; // NEW: Tracks modified data for write-back
+    bool dirty; 
     UINT64 tag;
     UINT32 freq;
     CacheBlock() : valid(false), dirty(false), tag(0), freq(0) {}
@@ -174,6 +175,9 @@ public:
     double getHitRate() const { 
         return accesses == 0 ? 0.0 : (double)hits / accesses * 100.0; 
     }
+    double getMissRate() const { 
+        return accesses == 0 ? 0.0 : (double)misses / accesses; 
+    }
     string getPolicyName() const {
         if (policy == LRU) return "LRU";
         if (policy == FIFO) return "FIFO";
@@ -246,6 +250,8 @@ KNOB< string > KnobInsCountFile(KNOB_MODE_WRITEONCE, "pintool", "i", "cache_stat
 
 VOID Fini(INT32 code, VOID* v) {
     OutFile.setf(std::ios::showbase);
+    OutFile << fixed << setprecision(4); // Clean up decimal outputs
+
     OutFile << "-------------------------------------------------------------------------------\n";  
     OutFile << "L1 DATA CACHE SIMULATION RESULTS (" << dl1_cache->getPolicyName() << ")\n";
     OutFile << "-------------------------------------------------------------------------------\n";  
@@ -264,8 +270,23 @@ VOID Fini(INT32 code, VOID* v) {
     OutFile << "Cache Hits          : " << dl2_cache->getHits() << "\n";
     OutFile << "Cache Misses        : " << dl2_cache->getMisses() << "\n";
     OutFile << "Hit Rate            : " << dl2_cache->getHitRate() << " %\n";
+
+    // AMAT CALCULATION
+    int L1_LATENCY = 1;     // dummy cycles
+    int L2_LATENCY = 10;    // dummy cycles
+    int MEM_LATENCY = 100;  // dummy cycles
     
+    double amat = L1_LATENCY + (dl1_cache->getMissRate() * (L2_LATENCY + (dl2_cache->getMissRate() * MEM_LATENCY)));
+
     OutFile << "-------------------------------------------------------------------------------\n";  
+    OutFile << "SYSTEM PERFORMANCE\n";
+    OutFile << "-------------------------------------------------------------------------------\n";  
+    OutFile << "L1 Latency          : " << L1_LATENCY << " cycles\n";
+    OutFile << "L2 Latency          : " << L2_LATENCY << " cycles\n";
+    OutFile << "Memory Latency      : " << MEM_LATENCY << " cycles\n";
+    OutFile << "AMAT                : " << amat << " cycles/access\n";
+    OutFile << "-------------------------------------------------------------------------------\n";  
+    
     OutFile.close();
 
     delete dl1_cache;
@@ -288,7 +309,7 @@ VOID Image(IMG img, VOID *v) {
 int main(int argc, char* argv[]) {
     if (PIN_Init(argc, argv)) return Usage();
 
-    // Initialize L1 Cache (Notice I fixed 3276 -> 32768 for a 32KB cache!)
+    // Initialize L1 Cache 
     dl1_cache = new Cache(32768, 64, 8, LFU);
     
     // Initialize L2 Cache
