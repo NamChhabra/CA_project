@@ -220,7 +220,7 @@ VOID RecordMemAccess(VOID* addr, bool isWrite) {
 }
 
 VOID Instruction(INS ins, VOID* v) {
-    if (INS_Address(ins) <= mainHigh && INS_Address(ins) >= mainLow) {
+    // if (INS_Address(ins) <= mainHigh && INS_Address(ins) >= mainLow) {
         
         INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)docount, IARG_END);   
 
@@ -242,7 +242,7 @@ VOID Instruction(INS ins, VOID* v) {
                                IARG_BOOL, true,  // isWrite = true
                                IARG_END);
             }
-        }
+        //}
     }
 }
 
@@ -310,7 +310,7 @@ int main(int argc, char* argv[]) {
     if (PIN_Init(argc, argv)) return Usage();
 
     // Initialize L1 Cache 
-    dl1_cache = new Cache(32768, 64, 8, LFU);
+    dl1_cache = new Cache(32768, 64, 8, LRU);
     
     // Initialize L2 Cache
     dl2_cache = new Cache(262144, 64, 16, LRU); 
