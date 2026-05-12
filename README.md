@@ -28,7 +28,7 @@ Address breakdown:
 The cache is instantiated in `main()` with the following parameters:
 
 dl1_cache = new Cache(32768, 64, 8, LRU);
-dl2_cache = new Cache(262144, 64, 16, LFU); 
+dl2_cache = new Cache(262144, 64, 16, LRU); 
 
 ## Pin Instrumentation
 
