@@ -27,19 +27,8 @@ Address breakdown:
 
 The cache is instantiated in `main()` with the following parameters:
 
-| Parameter      | Value    |
-|----------------|----------|
-| Cache Size     | 32 KB    |
-| Block Size     | 64 bytes |
-| Associativity  | 8-way    |
-| Replacement    | FIFO     |
-| Sets (derived) | 64       |
-
-To switch to LRU, change the last argument in `main()`:
-
-```cpp
 dl1_cache = new Cache(32768, 64, 8, LRU);
-```
+dl2_cache = new Cache(262144, 64, 16, LFU); 
 
 ## Pin Instrumentation
 
@@ -47,45 +36,192 @@ The tool uses two Pin callbacks. The **IMG callback** identifies the address ran
 
 Read-write operands (e.g., `add [rax], 1`) are counted as two separate accesses, consistent with real hardware behavior.
 
-## Output
-
-Results are written to `cache_stats.out`, configurable via the `-i` flag:
-
-```
-L1 DATA CACHE SIMULATION RESULTS
-Total Instructions  : 199061
-Total Mem Accesses  : 124051
-Cache Hits          : 123921
-Cache Misses        : 130
-Hit Rate            : 99.8952 %
-```
-
-## Building and Running
+## How to Build
 
 ```bash
-# Build (from your Pin tool directory)
-make
+# Navigate to the tool directory
+cd $PIN_ROOT/source/tools/MyPinTool
 
-# Run against a target binary
-pin -t obj-intel64/cache_sim.so -- ./your_program
+# Clean and compile (64-bit)
+make clean
+make obj-intel64/MyPinTool.so
 
-# Custom output file
-pin -t obj-intel64/cache_sim.so -i my_output.out -- ./your_program
+# Run Pin with your cache simulator on the target program
+$PIN_ROOT/pin -t obj-intel64/MyPinTool.so -- ./program
+
+# View simulation results
+cat cache_stats.out
+
+valgrind --tool=cachegrind --D1=32768,8,64 --LL=262144,16,64 ./program
+
 ```
 
-## Completed Phases
+## Cache Specifications
 
-**Phase 0** — Core data structures: `CacheBlock`, `CacheSet`, `Cache`
+- **L1 Data Cache:** 32 KB, 8-way associative, 64B block size  
+- **L2 Data Cache:** 256 KB, 16-way associative, 64B block size  
+- **Latencies:**  
+  - L1: 1 cycle  
+  - L2: 10 cycles  
+  - RAM: 100 cycles  
 
-**Phase 1** — LRU replacement policy
 
-**Phase 2** — FIFO replacement policy
+# Cache Simulator comparison with Cachegrind (Industrial Standard)
 
-**Phase 3** — Pin instrumentation (instruction counting + memory access tracing)
+## L1 Data Cache Misses Comparison
 
-## Planned Work
+| Implementation   | Simulator L1 Misses | Valgrind L1 Misses | Error (%)    |
+|------------------|---------------------|--------------------|--------------|
+| Naive MM         | 16,881,963         | 16,882,150        | **0.0011%** |
+| Tiled MM         | 163,589            | 163,998           | **0.249%**  |
 
-**Multi-Level Cache Hierarchy** — Extend the simulator to model L1 → L2 interactions, where an L1 miss triggers an L2 lookup. This includes separate hit/miss statistics per level, configurable size and associativity for each level, and options for inclusive vs. exclusive cache policies.
+## L2 Data Cache Misses Comparison
 
-**Write Policies** — Add support for write-through (cache and next memory level updated simultaneously on a write hit) and write-back (only the cache block is updated on a write hit, marked dirty, and written to the next level on eviction). Write-allocate and no-write-allocate behavior will also be configurable.
+| Implementation   | Simulator L2 Misses | Valgrind L2 Misses | Error (%)   |
+|------------------|---------------------|--------------------|-------------|
+| Naive MM         | 1,221,364           | 1,209,336          | **0.993%** |
+| Tiled MM         | 96,976              | 97,013             | **0.038%** |
 
+### Error Calculation
+**Error (%) =** `|Simulator - Valgrind| / Valgrind × 100`
+
+
+# Cache Simulator results
+
+|           Benchmark          |     Metric    |  LRU   |  FIFO  |   LFU   | Random |
+|------------------------------|---------------|--------|--------|---------|--------|
+|   Matrix multiplication      | L1 hit rate   | 93.35% | 93.12% |  90.99% | 93.11% |
+|                              | L2 hit rate   | 92.77% | 92.87% |  32.36% | 97.68% |
+|                              | AMAT (cycles) |  2.15  |  2.18  |   8.00  |  1.85  |
+|------------------------------|---------------|--------|--------|---------|--------|
+| Tiled matrix multiplication  | L1 hit rate   | 99.94% | 99.95% |  91.76% | 99.34% |
+|                              | L2 hit rate   | 59.09% | 48.64% |  90.74% | 96.80% |
+|                              | AMAT (cycles) |  1.03  |  1.033 |   2.59  |  1.09  |
+
+
+## Performance Summary
+
+- **Naive Matrix Multiplication:**  
+  Random replacement policy achieved the best performance with an AMAT of **1.85 cycles/access**, while LFU performed significantly worse with an AMAT of **8.00 cycles/access**.
+
+- **Tiled Matrix Multiplication:**  
+  LRU and FIFO achieved near-ideal performance with AMAT values close to **1.03 cycles/access**, reducing L1 miss rates to below **0.1%**.
+
+---
+
+## Key Findings
+
+### LRU Thrashing
+In the naive implementation, power-of-two matrix strides (`256 × 256`) caused severe conflict misses. LRU systematically evicted useful cache lines, allowing the Random policy to outperform it through probabilistic retention of required data.
+
+### Tiling Impact
+Tiling constrained the active working set to fit within L1 cache capacity, significantly improving temporal and spatial locality. This demonstrates how software-level locality optimizations can compensate for hardware replacement policy limitations.
+
+### LFU Pollution
+LFU performed poorly across all experiments because frequently accessed data from earlier execution phases remained cached for too long. This cache pollution prevented newly required tiles from entering the cache efficiently.
+
+## Completed Features
+
+### Phase 0 — Core Cache Data Structures
+Implemented the foundational cache simulator architecture:
+
+- `CacheBlock`
+  - Valid bit
+  - Dirty bit
+  - Tag storage
+  - Frequency counter (for LFU)
+
+- `CacheSet`
+  - Configurable associativity
+  - Block lookup and insertion
+  - Replacement handling
+
+- `Cache`
+  - Address decomposition (tag/index/block offset)
+  - Access tracking
+  - Hit/miss statistics
+  - AMAT calculation support
+
+---
+
+### Phase 1 — LRU Replacement Policy
+Implemented **Least Recently Used (LRU)** replacement using linked-list ordering.
+
+Features:
+- Recency tracking on every hit
+- Most recently used blocks moved to the front
+- Least recently used block evicted from the back
+
+---
+
+### Phase 2 — FIFO Replacement Policy
+Implemented **First-In First-Out (FIFO)** replacement.
+
+Features:
+- Preserves insertion order
+- Oldest inserted block selected for eviction
+- Lower bookkeeping overhead than LRU
+
+---
+
+### Phase 3 — Pin Instrumentation
+Integrated the simulator with Intel Pin for dynamic binary instrumentation.
+
+Features:
+- Instruction counting
+- Memory read tracing
+- Memory write tracing
+- Main executable filtering
+- Runtime statistics generation
+
+---
+
+### Phase 4 — Additional Replacement Policies
+Added support for more advanced and comparative replacement strategies.
+
+#### LFU (Least Frequently Used)
+- Tracks access frequency per cache block
+- Evicts the least frequently accessed block
+
+#### Random Replacement
+- Random victim selection using `std::mt19937`
+- Useful as a baseline policy for comparison studies
+
+---
+
+### Phase 5 — Multi-Level Cache Hierarchy
+Implemented a two-level cache hierarchy:
+
+- L1 Data Cache
+- L2 Data Cache
+
+Features:
+- L1 miss triggers L2 lookup
+- Independent statistics for each cache level
+- Configurable size, associativity, and block size
+- Inclusive hierarchy behavior
+
+---
+
+### Phase 6 — Write-Back Cache Support
+Implemented write-aware cache behavior with dirty block handling.
+
+Features:
+- Dirty bit tracking
+- Write-back propagation from L1 → L2
+- Dirty eviction handling
+- Write misses correctly initialize dirty blocks
+- Support for realistic memory hierarchy simulation
+
+---
+
+### Phase 7 — Performance Analysis Metrics
+Added system-level performance evaluation metrics.
+
+Features:
+- Hit rate and miss rate reporting
+- AMAT (Average Memory Access Time) calculation
+- Configurable latency parameters:
+  - L1 latency
+  - L2 latency
+  - Main memory latency
