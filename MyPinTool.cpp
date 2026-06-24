@@ -11,8 +11,6 @@ using namespace std;
 
 std::ofstream OutFile;
 
-// PHASE 0, 1, 2, 3: CACHE SIMULATOR CLASSES
-
 enum ReplacementPolicy {
     LRU,
     FIFO,
