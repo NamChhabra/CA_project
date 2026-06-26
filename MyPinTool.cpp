@@ -11,50 +11,56 @@ using namespace std;
 
 std::ofstream OutFile;
 
+
 enum ReplacementPolicy {
     LRU,
     FIFO,
     LFU,
-    RAN
+    RAN,
+    DYN
 };
 
-// 1. Cache Block (Holds valid bit, dirty bit, freq, and tag)
-struct CacheBlock {
-    bool valid;
-    bool dirty; 
-    UINT64 tag;
-    UINT32 freq;
-    CacheBlock() : valid(false), dirty(false), tag(0), freq(0) {}
-};
+// --- COMMAND LINE CONFIGURATION KNOBS ---
+KNOB<UINT32> KnobL1Size(KNOB_MODE_WRITEONCE, "pintool", "l1_size", "32768", "L1 cache size in bytes");
+KNOB<UINT32> KnobL1Assoc(KNOB_MODE_WRITEONCE, "pintool", "l1_assoc", "8", "L1 cache associativity");
+KNOB<UINT32> KnobL1Block(KNOB_MODE_WRITEONCE, "pintool", "l1_block", "64", "L1 cache block size");
+KNOB<string> KnobL1Policy(KNOB_MODE_WRITEONCE, "pintool", "l1_policy", "LRU", "L1 policy (LRU, FIFO, LFU, RAN, DYN)");
 
-// 2. Cache Set (Handles Associativity and Replacement Policy)
+KNOB<UINT32> KnobL2Size(KNOB_MODE_WRITEONCE, "pintool", "l2_size", "262144", "L2 cache size in bytes");
+KNOB<UINT32> KnobL2Assoc(KNOB_MODE_WRITEONCE, "pintool", "l2_assoc", "16", "L2 cache associativity");
+KNOB<UINT32> KnobL2Block(KNOB_MODE_WRITEONCE, "pintool", "l2_block", "64", "L2 cache block size");
+KNOB<string> KnobL2Policy(KNOB_MODE_WRITEONCE, "pintool", "l2_policy", "LRU", "L2 policy (LRU, FIFO, LFU, RAN, DYN)");
+
+ReplacementPolicy parsePolicy(const string& pol) {
+    if (pol == "FIFO") return FIFO;
+    if (pol == "LFU") return LFU;
+    if (pol == "RAN") return RAN;
+    if (pol == "DYN") return DYN;
+    return LRU; // Default
+}
+
 class CacheSet {
 private:
     UINT32 associativity;
-    ReplacementPolicy policy;
     list<CacheBlock> blocks; 
-
     std::mt19937 gen;
     std::uniform_int_distribution<int> dist;
 
 public:
-    CacheSet(UINT32 assoc, ReplacementPolicy pol) : associativity(assoc), policy(pol), gen(random_device{}()),
-          dist(0, assoc - 1) {}
+    CacheSet(UINT32 assoc) : associativity(assoc), gen(random_device{}()), dist(0, assoc - 1) {}
 
-    // Accepts isWrite, returns evicted state by reference
-    bool access(UINT64 tag, bool isWrite, bool& evictedDirty, UINT64& evictedTag) {
-        evictedDirty = false; // Default to false
+    // activePolicy is passed per-access
+    bool access(UINT64 tag, bool isWrite, bool& evictedDirty, UINT64& evictedTag, ReplacementPolicy activePolicy) {
+        evictedDirty = false; 
 
-        // Search the set for a matching tag
         for (auto it = blocks.begin(); it != blocks.end(); ++it) {
             if (it->valid && it->tag == tag) {
-                // HIT!
-                if (isWrite) it->dirty = true; // Mark as dirty on write
+                if (isWrite) it->dirty = true; 
 
-                if (policy == LFU || policy == FIFO || policy == RAN){
+                if (activePolicy == LFU || activePolicy == FIFO || activePolicy == RAN ){
                     it->freq++;
                 }
-                else if (policy == LRU) {
+                else if (activePolicy == LRU) {
                     CacheBlock hitBlock = *it;
                     hitBlock.freq++;
                     blocks.erase(it);
@@ -64,38 +70,34 @@ public:
             }
         }
 
-        // MISS!
+        // MISS HANDLING
         CacheBlock newBlock;
         newBlock.valid = true;
-        newBlock.dirty = isWrite; // starts dirty on write miss
+        newBlock.dirty = isWrite; 
         newBlock.tag = tag;
         newBlock.freq = 1;
 
         if (blocks.size() < associativity) {
-            // Still have room in this set
             blocks.push_front(newBlock);
         } else {
-            // Set is full. Find the victim to evict.
             auto victim = blocks.end();
 
-            if (policy == LRU || policy == FIFO) {
-                victim = std::prev(blocks.end()); // The block at the back
+            // Eviction logic uses activePolicy
+            if (activePolicy == LRU || activePolicy == FIFO) {
+                victim = std::prev(blocks.end()); 
             }
-            else if (policy == LFU) {
+            else if (activePolicy == LFU) {
                 victim = blocks.begin();
                 for (auto it = blocks.begin(); it != blocks.end(); ++it) {
-                    if (it->freq < victim->freq) {
-                        victim = it;
-                    }
+                    if (it->freq < victim->freq) victim = it;
                 }
             }
-            else if (policy == RAN) {
+            else if (activePolicy == RAN) {
                 int idx = dist(gen);
                 victim = blocks.begin();
-                std::advance(victim, idx); 
+                advance(victim, idx); 
             }
 
-            // if the chosen victim is dirty before erasing it
             if (victim->dirty) {
                 evictedDirty = true;
                 evictedTag = victim->tag;
@@ -108,17 +110,19 @@ public:
     }
 };
 
-// 3. The Cache Class
+
 class Cache {
 private:
     UINT32 numSets;
     UINT32 blockSize;
     UINT32 associativity;
     ReplacementPolicy policy;
-    
     vector<CacheSet> sets;
 
-    // Statistics
+    // Policy Selector for Set Dueling (DYN policy)
+    // psel > 0 means RAN is better, psel < 0 means LRU is better
+    int psel; 
+
     UINT64 hits;
     UINT64 misses;
     UINT64 accesses;
@@ -129,15 +133,14 @@ public:
         associativity = assoc;
         policy = pol;
         numSets = sizeBytes / (blockSize * associativity);
+        psel = 0; // Initialize saturating counter
 
         for (UINT32 i = 0; i < numSets; ++i) {
-            sets.push_back(CacheSet(associativity, policy));
+            sets.push_back(CacheSet(associativity)); // Removed fixed policy
         }
-
         hits = misses = accesses = 0;
     }
 
-    // Accepts isWrite, processes Write-Backs
     bool access(UINT64 addr, bool isWrite, bool& evictWB, UINT64& wbAddr) {
         accesses++;
         
@@ -148,10 +151,33 @@ public:
         bool evictedDirty = false;
         UINT64 evictedTag = 0;
 
-        // Pass write state down to the set
-        bool hit = sets[index].access(tag, isWrite, evictedDirty, evictedTag);
+        // --- SET DUELING LOGIC ---
+        ReplacementPolicy activePolicy = policy;
+        if (policy == DYN) {
+            if (index % 32 == 0) {
+                activePolicy = LRU; // Leader 0: Always uses LRU
+            } else if (index % 32 == 1) {
+                activePolicy = RAN; // Leader 1: Always uses Random
+            } else {
+                // Followers use the winner of the duel
+                activePolicy = (psel >= 0) ? RAN : LRU; 
+            }
+        }
+
+        // Pass activePolicy to the set
+        bool hit = sets[index].access(tag, isWrite, evictedDirty, evictedTag, activePolicy);
         
-        // If a dirty block was evicted, rebuild its absolute address
+        // Update Policy Selector on a miss
+        if (!hit && policy == DYN) {
+            if (index % 32 == 0) {
+                psel++; // LRU missed, so favor RAN
+                if (psel > 511) psel = 511; // 10-bit saturating counter upper bound
+            } else if (index % 32 == 1) {
+                psel--; // RAN missed, so favor LRU
+                if (psel < -512) psel = -512; // 10-bit saturating counter lower bound
+            }
+        }
+
         if (evictedDirty) {
             evictWB = true;
             wbAddr = ((evictedTag * numSets) + index) * blockSize;
@@ -159,14 +185,12 @@ public:
             evictWB = false;
         }
 
-        if (hit) {
-            hits++;
-        } else {
-            misses++;
-        }
+        if (hit) hits++;
+        else misses++;
+        
         return hit;
     }
-
+    // getter functions for good oop access
     UINT64 getHits() const { return hits; }
     UINT64 getMisses() const { return misses; }
     UINT64 getAccesses() const { return accesses; }
@@ -176,10 +200,11 @@ public:
     double getMissRate() const { 
         return accesses == 0 ? 0.0 : (double)misses / accesses; 
     }
-    string getPolicyName() const {
+string getPolicyName() const {
         if (policy == LRU) return "LRU";
         if (policy == FIFO) return "FIFO";
         if (policy == LFU) return "LFU";
+        if (policy == DYN) return "DYNAMIC (SET DUELING)";
         return "RANDOM";
     }
 };
@@ -197,28 +222,27 @@ Cache* dl2_cache;
 
 VOID docount() { icount++; }
 
-// Unified memory access hook, now aware of Read/Write and Write-Backs
 VOID RecordMemAccess(VOID* addr, bool isWrite) {
     bool evictWB = false;
     UINT64 wbAddr = 0;
 
-    // 1. Try L1 Cache
     if (!dl1_cache->access((UINT64)addr, isWrite, evictWB, wbAddr)) {
-        // L1 MISS: Fetch the missing block from L2 (This is a Read from L2's perspective)
+        // L1 miss, try L2
         bool dummyWB; UINT64 dummyAddr;
         dl2_cache->access((UINT64)addr, false, dummyWB, dummyAddr);
     }
 
-    // 2. Did L1 kick out a dirty block to make room?
+    // Did L1 kick out a dirty block?
     if (evictWB) {
-        // L1 WRITE-BACK: Write the modified block down to L2
+        // Write the modified block down to L2
         bool dummyWB; UINT64 dummyAddr;
         dl2_cache->access(wbAddr, true, dummyWB, dummyAddr);
     }
+
 }
 
 VOID Instruction(INS ins, VOID* v) {
-    // if (INS_Address(ins) <= mainHigh && INS_Address(ins) >= mainLow) {
+    if (INS_Address(ins) <= mainHigh && INS_Address(ins) >= mainLow) {
         
         INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)docount, IARG_END);   
 
@@ -240,7 +264,7 @@ VOID Instruction(INS ins, VOID* v) {
                                IARG_BOOL, true,  // isWrite = true
                                IARG_END);
             }
-        //}
+        }
     }
 }
 
@@ -270,9 +294,9 @@ VOID Fini(INT32 code, VOID* v) {
     OutFile << "Hit Rate            : " << dl2_cache->getHitRate() << " %\n";
 
     // AMAT CALCULATION
-    int L1_LATENCY = 1;     // dummy cycles
-    int L2_LATENCY = 10;    // dummy cycles
-    int MEM_LATENCY = 100;  // dummy cycles
+    int L1_LATENCY = 1;     
+    int L2_LATENCY = 10;    
+    int MEM_LATENCY = 100;  
     
     double amat = L1_LATENCY + (dl1_cache->getMissRate() * (L2_LATENCY + (dl2_cache->getMissRate() * MEM_LATENCY)));
 
@@ -305,13 +329,12 @@ VOID Image(IMG img, VOID *v) {
 }
 
 int main(int argc, char* argv[]) {
+    // PIN_Init returns true if parsing fails or user asks for help
     if (PIN_Init(argc, argv)) return Usage();
 
-    // Initialize L1 Cache 
-    dl1_cache = new Cache(32768, 64, 8, LRU);
-    
-    // Initialize L2 Cache
-    dl2_cache = new Cache(262144, 64, 16, LRU); 
+    // Initialize Caches dynamically
+    dl1_cache = new Cache(KnobL1Size.Value(), KnobL1Block.Value(), KnobL1Assoc.Value(), parsePolicy(KnobL1Policy.Value()));
+    dl2_cache = new Cache(KnobL2Size.Value(), KnobL2Block.Value(), KnobL2Assoc.Value(), parsePolicy(KnobL2Policy.Value()));
 
     OutFile.open(KnobInsCountFile.Value().c_str());
 
