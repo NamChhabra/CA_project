@@ -20,6 +20,14 @@ enum ReplacementPolicy {
     DYN
 };
 
+struct CacheBlock {
+    bool valid;
+    bool dirty; 
+    UINT64 tag;
+    UINT32 freq;
+    CacheBlock() : valid(false), dirty(false), tag(0), freq(0) {}
+};
+
 // --- COMMAND LINE CONFIGURATION KNOBS ---
 KNOB<UINT32> KnobL1Size(KNOB_MODE_WRITEONCE, "pintool", "l1_size", "32768", "L1 cache size in bytes");
 KNOB<UINT32> KnobL1Assoc(KNOB_MODE_WRITEONCE, "pintool", "l1_assoc", "8", "L1 cache associativity");
